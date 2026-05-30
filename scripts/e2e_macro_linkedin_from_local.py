@@ -12,9 +12,13 @@ async def main() -> None:
     python = repo_dir / ".venv" / "bin" / "python"
     server_script = repo_dir / "main.py"
 
-    tmp = Path(tempfile.gettempdir()) / "launchpilot-shot-macro.png"
-    img = PILImage.new("RGB", (1400, 900), (17, 24, 39))
-    img.save(tmp, format="PNG")
+    quote_card = repo_dir.parents[0] / "quote-card" / "images" / "feature-a" / "image.png"
+    if quote_card.exists():
+        screenshot = quote_card
+    else:
+        screenshot = Path(tempfile.gettempdir()) / "launchpilot-shot-macro.png"
+        img = PILImage.new("RGB", (1400, 900), (17, 24, 39))
+        img.save(screenshot, format="PNG")
 
     server_params = StdioServerParameters(command=str(python), args=[str(server_script)])
 
@@ -26,7 +30,7 @@ async def main() -> None:
                 {
                     "title": "LaunchPilot: Draft Launch Posts",
                     "summary": "Turn shipped features into launch-ready copy + thumbnails and save drafts for review.",
-                    "screenshot_paths": [str(tmp)],
+                    "screenshot_paths": [str(screenshot)],
                     "brand_hex": ["#0EA5E9", "#6366F1"],
                     "device": "laptop",
                     "size": "1200x627",

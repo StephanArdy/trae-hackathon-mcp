@@ -34,6 +34,10 @@ def _get_openai_image_model() -> str:
     return os.environ.get("OPENAI_IMAGE_MODEL") or "gpt-image-1"
 
 
+def _get_openai_bg_image_model() -> str:
+    return os.environ.get("OPENAI_BG_IMAGE_MODEL") or "gpt-image-2"
+
+
 def _supabase_url() -> str | None:
     return os.environ.get("SUPABASE_URL")
 
@@ -159,6 +163,136 @@ def _gradient_bg(width: int, height: int, colors: list[str] | None) -> PILImage.
     return PILImage.composite(top, base, mask)
 
 
+def _cover_resize(img: PILImage.Image, box: tuple[int, int]) -> PILImage.Image:
+    w, h = box
+    src_w, src_h = img.size
+    scale = max(w / src_w, h / src_h)
+    new_w = max(1, int(src_w * scale))
+    new_h = max(1, int(src_h * scale))
+    resized = img.resize((new_w, new_h), PILImage.Resampling.LANCZOS)
+    left = max(0, (new_w - w) // 2)
+    top = max(0, (new_h - h) // 2)
+    return resized.crop((left, top, left + w, top + h))
+
+
+def _openai_generate_image_png(prompt: str, model: str, size: str) -> bytes:
+    api_key = _require_env("OPENAI_API_KEY")
+    resp = httpx.post(
+        "https://api.openai.com/v1/images/generations",
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={
+            "model": model,
+            "prompt": prompt,
+            "size": size,
+        },
+        timeout=120,
+    )
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError:
+        raise RuntimeError(resp.text)
+    data = resp.json()
+    item = (data.get("data") or [{}])[0]
+
+    png_bytes: bytes | None = None
+    b64 = item.get("b64_json")
+    if b64:
+        png_bytes = base64.b64decode(b64)
+
+    url = item.get("url")
+    if (not png_bytes) and url:
+        img = httpx.get(url, timeout=120)
+        try:
+            img.raise_for_status()
+        except httpx.HTTPStatusError:
+            raise RuntimeError(img.text)
+        png_bytes = img.content
+
+    if not png_bytes:
+        raise RuntimeError("OpenAI returned no image")
+    return png_bytes
+
+
+def _openai_size_for_canvas(width: int, height: int) -> str:
+    aspect = width / max(1, height)
+    if aspect >= 1.18:
+        return "1536x1024"
+    if aspect <= 0.85:
+        return "1024x1536"
+    return "1024x1024"
+
+
+def _openai_edit_image_png(image_png: bytes, prompt: str, model: str, size: str) -> bytes:
+    api_key = _require_env("OPENAI_API_KEY")
+    files = {"image": ("image.png", image_png, "image/png")}
+    data = {"model": model, "prompt": prompt, "size": size}
+    resp = httpx.post(
+        "https://api.openai.com/v1/images/edits",
+        headers={"Authorization": f"Bearer {api_key}"},
+        files=files,
+        data=data,
+        timeout=180,
+    )
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError:
+        raise RuntimeError(resp.text)
+    payload = resp.json()
+    item = (payload.get("data") or [{}])[0]
+    b64 = item.get("b64_json")
+    if isinstance(b64, str) and b64:
+        return base64.b64decode(b64)
+    url = item.get("url")
+    if isinstance(url, str) and url:
+        img = httpx.get(url, timeout=180)
+        try:
+            img.raise_for_status()
+        except httpx.HTTPStatusError:
+            raise RuntimeError(img.text)
+        return img.content
+    raise RuntimeError("OpenAI returned no edited image")
+
+
+def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> list[str]:
+    words = (text or "").strip().split()
+    if not words:
+        return []
+    lines: list[str] = []
+    cur: list[str] = []
+    for w in words:
+        trial = " ".join(cur + [w])
+        bbox = draw.textbbox((0, 0), trial, font=font)
+        if (bbox[2] - bbox[0]) <= max_width or not cur:
+            cur.append(w)
+        else:
+            lines.append(" ".join(cur))
+            cur = [w]
+    if cur:
+        lines.append(" ".join(cur))
+    return lines
+
+
+def _fit_font_to_box(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    max_width: int,
+    max_lines: int,
+    start_size: int,
+    min_size: int,
+) -> tuple[ImageFont.ImageFont, list[str]]:
+    size = start_size
+    while size >= min_size:
+        font = _load_font(size)
+        lines = _wrap_text(draw, text, font, max_width=max_width)
+        if not lines:
+            return font, []
+        if len(lines) <= max_lines:
+            return font, lines
+        size -= 2
+    font = _load_font(min_size)
+    return font, _wrap_text(draw, text, font, max_width=max_width)[:max_lines]
+
+
 def _fit_contain(img: PILImage.Image, box: tuple[int, int]) -> PILImage.Image:
     w, h = box
     src_w, src_h = img.size
@@ -225,6 +359,9 @@ def generate_mockup_thumbnail(
     brand_hex: list[str] | None = None,
     device: str = "auto",
     size: str = "1200x627",
+    background_mode: str = "ai",
+    background_prompt: str | None = None,
+    background_model: str | None = None,
     upload: bool = True,
     object_path: str | None = None,
 ) -> list[types.Content]:
@@ -232,7 +369,32 @@ def generate_mockup_thumbnail(
         raise ValueError("screenshot_urls is required")
 
     width, height = _parse_size(size)
-    bg = _gradient_bg(width, height, brand_hex).convert("RGBA")
+    bg_mode_used = "gradient"
+    bg_model_used: str | None = None
+    bg_prompt_used: str | None = None
+    bg_fallback = False
+
+    mode = (background_mode or "gradient").strip().lower()
+    if mode == "ai":
+        bg_model_used = background_model or _get_openai_bg_image_model()
+        colors_str = ", ".join(brand_hex or [])
+        bg_prompt_used = (
+            background_prompt
+            or f"""High-end abstract background for a SaaS product launch thumbnail.
+Color palette: {colors_str or "dark navy, electric cyan, indigo glow"}.
+Style: modern, premium, subtle gradient glow, soft depth, light noise texture, clean shapes, minimal.
+No text, no logos, no UI, no watermarks, no people."""
+        ).strip()
+        try:
+            bg_png = _openai_generate_image_png(bg_prompt_used, model=bg_model_used, size="1024x1024")
+            bg_img = PILImage.open(BytesIO(bg_png)).convert("RGBA")
+            bg = _cover_resize(bg_img, (width, height))
+            bg_mode_used = "ai"
+        except Exception:
+            bg = _gradient_bg(width, height, brand_hex).convert("RGBA")
+            bg_fallback = True
+    else:
+        bg = _gradient_bg(width, height, brand_hex).convert("RGBA")
 
     shots: list[PILImage.Image] = []
     for u in screenshot_urls[:3]:
@@ -308,12 +470,42 @@ def generate_mockup_thumbnail(
 
     hx = pad
     hy = int(height * 0.20)
-    head_font = _load_font(int(height * 0.085))
-    sub_font = _load_font(int(height * 0.045))
+    headline_box_w = text_w
 
-    draw.text((hx, hy), headline, fill=(255, 255, 255, 255), font=head_font)
-    if subheadline:
-        draw.text((hx, hy + int(height * 0.12)), subheadline, fill=(226, 232, 240, 255), font=sub_font)
+    head_font, head_lines = _fit_font_to_box(
+        draw,
+        headline,
+        max_width=headline_box_w,
+        max_lines=3,
+        start_size=int(height * 0.095),
+        min_size=max(22, int(height * 0.055)),
+    )
+    sub_font, sub_lines = _fit_font_to_box(
+        draw,
+        subheadline or "",
+        max_width=headline_box_w,
+        max_lines=2,
+        start_size=int(height * 0.048),
+        min_size=max(18, int(height * 0.036)),
+    )
+
+    shadow = (0, 0, 0, 160)
+    text_y = hy
+    line_gap = int(head_font.size * 0.22) if hasattr(head_font, "size") else int(height * 0.02)
+    for line in head_lines:
+        draw.text((hx + 2, text_y + 2), line, fill=shadow, font=head_font)
+        draw.text((hx, text_y), line, fill=(255, 255, 255, 255), font=head_font)
+        bbox = draw.textbbox((0, 0), line, font=head_font)
+        text_y += (bbox[3] - bbox[1]) + line_gap
+
+    if sub_lines:
+        text_y += int(height * 0.02)
+        sub_gap = int(sub_font.size * 0.28) if hasattr(sub_font, "size") else int(height * 0.018)
+        for line in sub_lines:
+            draw.text((hx + 2, text_y + 2), line, fill=shadow, font=sub_font)
+            draw.text((hx, text_y), line, fill=(226, 232, 240, 255), font=sub_font)
+            bbox = draw.textbbox((0, 0), line, font=sub_font)
+            text_y += (bbox[3] - bbox[1]) + sub_gap
 
     if len(shots) > 1:
         thumb_w = int(text_w * 0.45)
@@ -347,6 +539,10 @@ def generate_mockup_thumbnail(
         "size": f"{width}x{height}",
         "device": device_value,
         "screenshots": screenshot_urls[:3],
+        "background_mode": bg_mode_used,
+        "background_model": bg_model_used,
+        "background_prompt": bg_prompt_used,
+        "background_fallback": bg_fallback,
     }
     return [
         types.TextContent(type="text", text=json.dumps(meta, ensure_ascii=False)),
@@ -362,42 +558,8 @@ def generate_thumbnail(
     upload: bool | None = None,
     object_path: str | None = None,
 ) -> list[types.Content]:
-    api_key = _require_env("OPENAI_API_KEY")
     image_model = model or _get_openai_image_model()
-
-    resp = httpx.post(
-        "https://api.openai.com/v1/images/generations",
-        headers={"Authorization": f"Bearer {api_key}"},
-        json={
-            "model": image_model,
-            "prompt": prompt,
-            "size": size,
-        },
-        timeout=120,
-    )
-    try:
-        resp.raise_for_status()
-    except httpx.HTTPStatusError:
-        raise RuntimeError(resp.text)
-    data = resp.json()
-    item = (data.get("data") or [{}])[0]
-
-    png_bytes: bytes | None = None
-    b64 = item.get("b64_json")
-    if b64:
-        png_bytes = base64.b64decode(b64)
-
-    url = item.get("url")
-    if (not png_bytes) and url:
-        img = httpx.get(url, timeout=120)
-        try:
-            img.raise_for_status()
-        except httpx.HTTPStatusError:
-            raise RuntimeError(img.text)
-        png_bytes = img.content
-
-    if not png_bytes:
-        raise RuntimeError("OpenAI returned no image")
+    png_bytes = _openai_generate_image_png(prompt, model=image_model, size=size)
 
     should_upload = upload
     if should_upload is None:
@@ -540,6 +702,7 @@ def launch_linkedin_from_screenshots(
     brand_hex: list[str] | None = None,
     device: str = "laptop",
     size: str = "1200x627",
+    background_mode: str = "ai",
 ) -> dict[str, Any]:
     if not screenshot_paths:
         raise ValueError("screenshot_paths is required")
@@ -549,12 +712,22 @@ def launch_linkedin_from_screenshots(
 
     model = _get_openai_text_model()
     prompt = f"""
-You are a launch copywriter and designer for LinkedIn.
+You are a senior launch copywriter + designer for LinkedIn.
+Voice: indie hacker (builder vibe), crisp, product-led, minimal fluff.
 
 Write:
-1) A short headline (max 6 words)
-2) A short subheadline (max 5 words)
-3) A LinkedIn post copy (professional, concise, 600-900 chars)
+1) A short headline (max 6 words) that names the outcome (no "Memperkenalkan/Introducing").
+2) A short subheadline (max 7 words) that clarifies the value.
+3) A LinkedIn post copy (600-900 chars) in Indonesian with:
+   - 1 hook line (builder vibe)
+   - 3 bullets (feature -> benefit), very short
+   - 1 short CTA without any link
+   - max 2 emojis total (optional)
+   - up to 3 hashtags at the very end
+4) A thumbnail_edit_prompt: instructions for an image model to create a premium SaaS marketing thumbnail by remixing the provided screenshot.
+   - Must keep the screenshot recognizable/readable
+   - No random text/logos/watermarks/people
+   - Leave clean negative space on the left for headline/subheadline overlay
 
 Title: {title}
 Summary: {summary}
@@ -564,24 +737,96 @@ Return JSON only with this schema:
 {{
   "headline": "string",
   "subheadline": "string",
-  "copy": "string"
+  "copy": "string",
+  "thumbnail_edit_prompt": "string"
 }}
 """.strip()
 
     text = _openai_responses(model=model, input_text=prompt)
     plan = _parse_json(text)
 
-    mock = generate_mockup_thumbnail(
-        screenshot_urls=screenshot_urls,
-        headline=str(plan.get("headline") or title),
-        subheadline=str(plan.get("subheadline") or ""),
-        brand_hex=brand_hex,
-        device=device,
-        size=size,
-        upload=True,
-    )
-    meta = _parse_json(mock[0].text)
-    thumbnail_url = meta.get("thumbnail_url")
+    width, height = _parse_size(size)
+    thumbnail_url: str | None = None
+    try:
+        p0 = Path(screenshot_paths[0]).expanduser()
+        shot = PILImage.open(p0).convert("RGBA")
+        buf = BytesIO()
+        shot.save(buf, format="PNG")
+        shot_png = buf.getvalue()
+
+        edit_model = _get_openai_bg_image_model()
+        edit_size = _openai_size_for_canvas(width, height)
+        colors_str = ", ".join(brand_hex or [])
+        edit_prompt = (
+            str(plan.get("thumbnail_edit_prompt") or "").strip()
+            or f"""Create a premium SaaS marketing thumbnail by remixing the provided screenshot.
+Color palette: {colors_str or "teal and purple"}.
+Style: modern, high-contrast, clean, subtle glow, soft depth, minimal.
+Constraints: keep the screenshot recognizable and readable; no new logos; no watermarks; no random UI text; no people; leave clear negative space on the left for headline text overlay."""
+        )
+        ai_png = _openai_edit_image_png(shot_png, prompt=edit_prompt, model=edit_model, size=edit_size)
+        ai_img = PILImage.open(BytesIO(ai_png)).convert("RGBA")
+        canvas = _cover_resize(ai_img, (width, height))
+
+        draw = ImageDraw.Draw(canvas)
+        pad = int(width * 0.06)
+        text_w = int(width * 0.46)
+        hx = pad
+        hy = int(height * 0.18)
+
+        head_font, head_lines = _fit_font_to_box(
+            draw,
+            str(plan.get("headline") or title),
+            max_width=text_w,
+            max_lines=3,
+            start_size=int(height * 0.10),
+            min_size=max(22, int(height * 0.055)),
+        )
+        sub_font, sub_lines = _fit_font_to_box(
+            draw,
+            str(plan.get("subheadline") or ""),
+            max_width=text_w,
+            max_lines=2,
+            start_size=int(height * 0.05),
+            min_size=max(18, int(height * 0.036)),
+        )
+
+        shadow = (0, 0, 0, 170)
+        text_y = hy
+        line_gap = int(getattr(head_font, "size", int(height * 0.08)) * 0.22)
+        for line in head_lines:
+            draw.text((hx + 3, text_y + 3), line, fill=shadow, font=head_font)
+            draw.text((hx, text_y), line, fill=(255, 255, 255, 255), font=head_font)
+            bbox = draw.textbbox((0, 0), line, font=head_font)
+            text_y += (bbox[3] - bbox[1]) + line_gap
+
+        if sub_lines:
+            text_y += int(height * 0.02)
+            sub_gap = int(getattr(sub_font, "size", int(height * 0.04)) * 0.28)
+            for line in sub_lines:
+                draw.text((hx + 2, text_y + 2), line, fill=shadow, font=sub_font)
+                draw.text((hx, text_y), line, fill=(226, 232, 240, 255), font=sub_font)
+                bbox = draw.textbbox((0, 0), line, font=sub_font)
+                text_y += (bbox[3] - bbox[1]) + sub_gap
+
+        out = BytesIO()
+        canvas.save(out, format="PNG")
+        final_png = out.getvalue()
+        thumbnail_url = _supabase_upload_png(final_png, f"thumbnails/{uuid4().hex}.png")
+    except Exception:
+        mock = generate_mockup_thumbnail(
+            screenshot_urls=screenshot_urls,
+            headline=str(plan.get("headline") or title),
+            subheadline=str(plan.get("subheadline") or ""),
+            brand_hex=brand_hex,
+            device=device,
+            size=size,
+            background_mode=background_mode,
+            background_prompt=None,
+            upload=True,
+        )
+        meta = _parse_json(mock[0].text)
+        thumbnail_url = meta.get("thumbnail_url")
 
     saved = save_draft(
         title=title,
